@@ -10,15 +10,20 @@ o888ooooood8 `Y8bod8P' `Y8bod8P' `Y888\"\"8o o888o o888o     .8'
                                                        `Y8P'
 ```
 
-## Add our HomeBrew Tap
+## Step 1: Add our HomeBrew Tap
 
 ```shell
 brew tap locallybuild/tap
 ```
 
-## Install the Locally CLI
+## Step 2: Trust our HomeBrew Tap
+
+```shell
+brew trust locallybuild/tap
+```
+
+## Step 3: Install the Locally CLI
 
 ```shell
 brew install locallybuild/tap/locally
 ```
-
