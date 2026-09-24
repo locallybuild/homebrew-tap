@@ -1,0 +1,248 @@
+name: update-formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'CLI version to bump to. Use "latest" or a pinned version (e.g. "v2026.09" or "2026.09.01").'
+        default: latest
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should-update: ${{ steps.decide.outputs.should-update }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve CLI version
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          if [ "$REQUESTED_VERSION" != "latest" ]; then
+            resolved="$REQUESTED_VERSION"
+          else
+            url="https://get.locally.build/v1/cli/latest/version"
+            body_file="$(mktemp)"
+            http_code="$(curl -sSL -A "homebrew-tap-update/0.1" --max-time 30 --retry 2 --retry-delay 2 -o "$body_file" -w '%{http_code}' "$url")"
+            rc=$?
+            body="$(cat "$body_file" 2>/dev/null || true)"
+            rm -f "$body_file"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::curl failed (exit $rc) reaching $url"
+              exit 1
+            fi
+            if [ "$http_code" != "200" ]; then
+              echo "::error::$url returned HTTP $http_code (body: $(printf '%q' "$body"))"
+              exit 1
+            fi
+            resolved="$body"
+          fi
+          # Strip leading 'v' and surrounding whitespace
+          resolved="$(printf '%s' "$resolved" | tr -d '[:space:]')"
+          resolved="${resolved#v}"
+          if [ -z "$resolved" ]; then
+            echo "::error::resolved version is empty"
+            exit 1
+          fi
+          echo "Resolved version: $resolved"
+          echo "version=$resolved" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify all platform tarballs
+        id: download
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/locally-tarballs"
+          mkdir -p "$work"
+          cd "$work"
+
+          declare -A SHAS
+          for platform in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+            url="https://get.locally.build/v1/cli/${VERSION}/${platform}"
+            slug="$(echo "$platform" | tr '/' '_')"
+
+            # Download the tarball. Compute its sha — this is the value Homebrew
+            # will verify against, so it goes into the Formula.
+            curl -fsSL -A "homebrew-tap-update/0.1" --max-time 120 --retry 2 --retry-delay 5 -o "${slug}.tar.gz" "$url"
+            tarball_sha="$(shasum -a 256 "${slug}.tar.gz" | awk '{print $1}')"
+
+            # Verify the computed tarball sha against /archive-sha256.
+            expected_archive="$(curl -fsSL -A "homebrew-tap-update/0.1" --max-time 30 --retry 2 --retry-delay 2 "${url}/archive-sha256" | awk '{print $1}')"
+            if [ "$expected_archive" != "$tarball_sha" ]; then
+              echo "::error::archive sha mismatch for ${platform}: /archive-sha256 says ${expected_archive}, computed ${tarball_sha}"
+              exit 1
+            fi
+            echo "verified archive ${platform}: ${tarball_sha}"
+
+            # Verify the inner binary against /sha256 by extracting and hashing.
+            mkdir -p "extract_${slug}"
+            tar -xzf "${slug}.tar.gz" -C "extract_${slug}"
+            binary_path="extract_${slug}/locally"
+            if [ ! -f "$binary_path" ]; then
+              echo "::error::tarball for ${platform} did not contain a 'locally' binary at the root"
+              exit 1
+            fi
+            binary_sha="$(shasum -a 256 "$binary_path" | awk '{print $1}')"
+            expected_binary="$(curl -fsSL -A "homebrew-tap-update/0.1" --max-time 30 --retry 2 --retry-delay 2 "${url}/sha256" | tr -d '[:space:]')"
+            if [ "$expected_binary" != "$binary_sha" ]; then
+              echo "::error::binary sha mismatch for ${platform}: /sha256 says ${expected_binary}, computed ${binary_sha}"
+              exit 1
+            fi
+            echo "verified inner binary ${platform}: ${binary_sha}"
+
+            SHAS["$platform"]="$tarball_sha"
+          done
+
+          # Emit per-platform SHAs as step outputs for the next step.
+          {
+            echo "sha-darwin-arm64=${SHAS["darwin/arm64"]}"
+            echo "sha-darwin-amd64=${SHAS["darwin/amd64"]}"
+            echo "sha-linux-arm64=${SHAS["linux/arm64"]}"
+            echo "sha-linux-amd64=${SHAS["linux/amd64"]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read current Formula state
+        id: current
+        run: |
+          set -euo pipefail
+          current_json="$(python3 scripts/update_formula.py read Formula/locally.rb)"
+          echo "current Formula: $current_json"
+          {
+            echo "version=$(echo "$current_json" | jq -r '.version')"
+            echo "sha-darwin-arm64=$(echo "$current_json" | jq -r '.shas["darwin/arm64"]')"
+            echo "sha-darwin-amd64=$(echo "$current_json" | jq -r '.shas["darwin/amd64"]')"
+            echo "sha-linux-arm64=$(echo "$current_json" | jq -r '.shas["linux/arm64"]')"
+            echo "sha-linux-amd64=$(echo "$current_json" | jq -r '.shas["linux/amd64"]')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to update
+        id: decide
+        env:
+          NEW_VERSION: ${{ steps.resolve.outputs.version }}
+          NEW_SHA_DARWIN_ARM64: ${{ steps.download.outputs.sha-darwin-arm64 }}
+          NEW_SHA_DARWIN_AMD64: ${{ steps.download.outputs.sha-darwin-amd64 }}
+          NEW_SHA_LINUX_ARM64: ${{ steps.download.outputs.sha-linux-arm64 }}
+          NEW_SHA_LINUX_AMD64: ${{ steps.download.outputs.sha-linux-amd64 }}
+          CUR_VERSION: ${{ steps.current.outputs.version }}
+          CUR_SHA_DARWIN_ARM64: ${{ steps.current.outputs.sha-darwin-arm64 }}
+          CUR_SHA_DARWIN_AMD64: ${{ steps.current.outputs.sha-darwin-amd64 }}
+          CUR_SHA_LINUX_ARM64: ${{ steps.current.outputs.sha-linux-arm64 }}
+          CUR_SHA_LINUX_AMD64: ${{ steps.current.outputs.sha-linux-amd64 }}
+        run: |
+          set -euo pipefail
+          if [ "$NEW_VERSION" = "$CUR_VERSION" ] \
+              && [ "$NEW_SHA_DARWIN_ARM64" = "$CUR_SHA_DARWIN_ARM64" ] \
+              && [ "$NEW_SHA_DARWIN_AMD64" = "$CUR_SHA_DARWIN_AMD64" ] \
+              && [ "$NEW_SHA_LINUX_ARM64" = "$CUR_SHA_LINUX_ARM64" ] \
+              && [ "$NEW_SHA_LINUX_AMD64" = "$CUR_SHA_LINUX_AMD64" ]; then
+            echo "Formula already up to date at v${NEW_VERSION}; nothing to do"
+            echo "should-update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed: version ${CUR_VERSION} -> ${NEW_VERSION}"
+            echo "should-update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rewrite Formula
+        if: steps.decide.outputs.should-update == 'true'
+        env:
+          NEW_VERSION: ${{ steps.resolve.outputs.version }}
+          NEW_SHA_DARWIN_ARM64: ${{ steps.download.outputs.sha-darwin-arm64 }}
+          NEW_SHA_DARWIN_AMD64: ${{ steps.download.outputs.sha-darwin-amd64 }}
+          NEW_SHA_LINUX_ARM64: ${{ steps.download.outputs.sha-linux-arm64 }}
+          NEW_SHA_LINUX_AMD64: ${{ steps.download.outputs.sha-linux-amd64 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/update_formula.py write Formula/locally.rb \
+            --version "$NEW_VERSION" \
+            --sha-darwin-arm64 "$NEW_SHA_DARWIN_ARM64" \
+            --sha-darwin-amd64 "$NEW_SHA_DARWIN_AMD64" \
+            --sha-linux-arm64 "$NEW_SHA_LINUX_ARM64" \
+            --sha-linux-amd64 "$NEW_SHA_LINUX_AMD64"
+          echo "--- diff ---"
+          git --no-pager diff Formula/locally.rb
+
+      - name: Upload rewritten Formula
+        if: steps.decide.outputs.should-update == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-formula
+          path: Formula/locally.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.should-update == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, macos-27]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@main
+
+      - name: Cache Homebrew Bundler RubyGems
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.set-up-homebrew.outputs.gems-path }}
+          key: ${{ matrix.os }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
+          restore-keys: ${{ matrix.os }}-rubygems-
+
+      - name: Download rewritten Formula
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-formula
+          path: Formula/
+
+      - run: brew test-bot --only-cleanup-before
+      - run: brew test-bot --only-setup
+      - run: brew test-bot --only-tap-syntax
+      - run: brew test-bot --only-formulae
+
+  commit:
+    needs: [prepare, validate]
+    if: needs.prepare.outputs.should-update == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Download rewritten Formula
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-formula
+          path: Formula/
+
+      - name: Commit and push
+        env:
+          NEW_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/locally.rb
+          if git diff --staged --quiet; then
+            echo "::error::commit job ran but Formula/locally.rb was not modified by the artifact"
+            exit 1
+          fi
+          git commit -m "bump locally to v${NEW_VERSION}"
+          git push origin main
