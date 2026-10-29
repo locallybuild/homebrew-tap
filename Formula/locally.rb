@@ -1,29 +1,29 @@
 class Locally < Formula
   desc "Local Azure environment that runs entirely on your machine"
   homepage "https://locally.build/"
-  version "2026.10"
+  version "2026.10.01"
 
   if OS.mac?
     if Hardware::CPU.arm?
       url "https://get.locally.build/v1/cli/#{version}/darwin/arm64"
-      sha256 "abb89ec8706fafaf81f95000e8b720f87c923e3323ad7f96c91f4dd9c0293b76"
+      sha256 "450ac6640e8ff2e77f388b557c2c234010ef34a5eec9d8d81b54eea6564ba291"
     end
 
     if Hardware::CPU.intel?
       url "https://get.locally.build/v1/cli/#{version}/darwin/amd64"
-      sha256 "5cb0fdce3a368660736101c187747e590429f7de36ffbfe282bfb6deca62c0dd"
+      sha256 "5ee2b0a6521c57472a0eb5c884bb3e3210abcb4fc5ddeb3a7b605176d32630b5"
     end
   end
 
   if OS.linux?
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
       url "https://get.locally.build/v1/cli/#{version}/linux/arm64"
-      sha256 "e2c87dde757c0b52a1961702f4c0a19cddc8d3a0b9fc21f86d16e980be57ff66"
+      sha256 "a931666a47273a5174db8e5be0eead90fb9d3662532491294bc044ee01b46a45"
     end
 
     if Hardware::CPU.intel?
       url "https://get.locally.build/v1/cli/#{version}/linux/amd64"
-      sha256 "852d0f10947ea1bb80384d88d50ede059028ad50de94de03c6c00d2c30be09e8"
+      sha256 "0d147e66a473200221eb0398482882b0413fdeced30742eb17129870d1b3612d"
     end
   end
 
